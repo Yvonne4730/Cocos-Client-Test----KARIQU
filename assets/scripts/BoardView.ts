@@ -1,9 +1,21 @@
-import { _decorator, Component, Node, UITransform, SpriteFrame, view, Vec3, Layers } from 'cc';
+import { _decorator, Component, Node, UITransform, SpriteFrame, view, Vec3, Layers, sys } from 'cc';
 import { BoardConfig } from './BoardConfig';
 import { CellView } from './CellView';
 import { ItemView, IItemDragDelegate } from './ItemView';
 import { GeneratorView, IGeneratorDelegate } from './GeneratorView';
 const { ccclass, property } = _decorator;
+
+interface SavedItem {
+    type: string;
+    level: number;
+    col: number;
+    row: number;
+}
+
+interface BoardSave {
+    version: number;
+    items: SavedItem[];
+}
 
 /**
  * 棋盘主控制器
@@ -18,6 +30,9 @@ const { ccclass, property } = _decorator;
  */
 @ccclass('BoardView')
 export class BoardView extends Component implements IItemDragDelegate, IGeneratorDelegate {
+    private static readonly SAVE_KEY = 'merge_board_save_v1';
+    private static readonly SAVE_VERSION = 1;
+
     @property({
         type: SpriteFrame,
         tooltip: '可选：如果后续提供单格贴图可拖入此处；未指定时自动使用原题配色色块高保真渲染'
@@ -67,7 +82,14 @@ export class BoardView extends Component implements IItemDragDelegate, IGenerato
         this._createAllCells();
         this._adaptScreenScale();
         this._createGenerator();
+
+        const savedItems = this._loadSave();
+        if (savedItems && this._restoreItems(savedItems)) {
+            return;
+        }
+
         this._spawnTestItems();
+        this._saveBoardState();
     }
 
     /**
@@ -161,6 +183,134 @@ export class BoardView extends Component implements IItemDragDelegate, IGenerato
         }
     }
 
+    /** 读取并校验本地存档；无存档、损坏或不支持的数据返回 null。 */
+    private _loadSave(): SavedItem[] | null {
+        try {
+            const raw = sys.localStorage.getItem(BoardView.SAVE_KEY);
+            if (!raw) {
+                return null;
+            }
+
+            const parsed: unknown = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') {
+                return null;
+            }
+
+            const save = parsed as Partial<BoardSave>;
+            if (save.version !== BoardView.SAVE_VERSION || !Array.isArray(save.items)) {
+                return null;
+            }
+
+            const occupied = new Set<string>();
+            const generator = BoardView.GENERATOR_POS;
+            for (const item of save.items) {
+                if (!item || typeof item !== 'object' || item.type !== 'clothes') {
+                    return null;
+                }
+                if (!Number.isInteger(item.level) || item.level < 1 || item.level > BoardConfig.MAX_LEVEL) {
+                    return null;
+                }
+                if (!Number.isInteger(item.col) || item.col < 0 || item.col >= BoardConfig.COLS ||
+                    !Number.isInteger(item.row) || item.row < 0 || item.row >= BoardConfig.ROWS) {
+                    return null;
+                }
+                if (item.col === generator.col && item.row === generator.row) {
+                    return null;
+                }
+
+                const position = `${item.col},${item.row}`;
+                if (occupied.has(position)) {
+                    return null;
+                }
+                occupied.add(position);
+            }
+
+            return save.items as SavedItem[];
+        } catch (error) {
+            console.warn('[MergeBoard] 读取本地存档失败，将使用初始棋盘。', error);
+            return null;
+        }
+    }
+
+    /** 按已校验的数据恢复物品；创建异常时清除部分恢复结果并回退。 */
+    private _restoreItems(items: SavedItem[]): boolean {
+        try {
+            for (const data of items) {
+                if (!this.createItem(data.type, data.level, data.col, data.row)) {
+                    console.warn('[MergeBoard] 恢复存档时创建物品失败，将使用默认棋盘。');
+                    this._clearRestoredItems();
+                    return false;
+                }
+            }
+            return true;
+        } catch (error) {
+            console.warn('[MergeBoard] 恢复存档时创建物品发生异常，将使用默认棋盘。', error);
+            this._clearRestoredItems();
+            return false;
+        }
+    }
+
+    /** 只清理普通物品节点并重建空网格引用，保留独立管理的生成器。 */
+    private _clearRestoredItems(): void {
+        try {
+            const container = this._itemsContainer;
+            if (container) {
+                for (const child of [...container.children]) {
+                    try {
+                        if (child === this._generator?.node) {
+                            continue;
+                        }
+
+                        // createItem 先将 Item_* 节点挂入容器，再添加组件并登记到 _items。
+                        // 同时按组件识别物品，覆盖创建中途节点名称变化的情况。
+                        const isItemNode = child.name.startsWith('Item_') || child.getComponent(ItemView);
+                        if (isItemNode && !child.getComponent(GeneratorView)) {
+                            child.active = false;
+                            child.destroy();
+                        }
+                    } catch (error) {
+                        console.warn(`[MergeBoard] 清理恢复物品节点失败：${child.name}`, error);
+                    }
+                }
+            }
+        } catch (error) {
+            console.warn('[MergeBoard] 清理恢复物品时发生异常。', error);
+        } finally {
+            this._items = [];
+            for (let col = 0; col < BoardConfig.COLS; col++) {
+                this._items[col] = [];
+                for (let row = 0; row < BoardConfig.ROWS; row++) {
+                    this._items[col][row] = null;
+                }
+            }
+        }
+    }
+
+    /** 保存当前普通物品列表，不保存固定生成器的固定坐标。 */
+    private _saveBoardState(): void {
+        const items: SavedItem[] = [];
+        for (let col = 0; col < BoardConfig.COLS; col++) {
+            for (let row = 0; row < BoardConfig.ROWS; row++) {
+                const item = this._items[col][row];
+                if (item) {
+                    items.push({
+                        type: item.itemType,
+                        level: item.level,
+                        col: item.col,
+                        row: item.row,
+                    });
+                }
+            }
+        }
+
+        const save: BoardSave = { version: BoardView.SAVE_VERSION, items };
+        try {
+            sys.localStorage.setItem(BoardView.SAVE_KEY, JSON.stringify(save));
+        } catch (error) {
+            console.warn('[MergeBoard] 保存本地棋盘状态失败。', error);
+        }
+    }
+
     /**
      * 实现 IGeneratorDelegate：响应生成器点击
      */
@@ -172,7 +322,9 @@ export class BoardView extends Component implements IItemDragDelegate, IGenerato
         }
 
         console.log(`[MergeBoard] 生成器点击：在空格 (${emptyCell.col}, ${emptyCell.row}) 产出 1 级衣服`);
-        this.createItem('clothes', 1, emptyCell.col, emptyCell.row);
+        if (this.createItem('clothes', 1, emptyCell.col, emptyCell.row)) {
+            this._saveBoardState();
+        }
     }
 
     /**
@@ -269,6 +421,7 @@ export class BoardView extends Component implements IItemDragDelegate, IGenerato
             this._items[oldCol][oldRow] = null;
             this._items[targetCol][targetRow] = item;
             item.setGridPosition(targetCol, targetRow);
+            this._saveBoardState();
             return true;
         }
 
@@ -292,6 +445,8 @@ export class BoardView extends Component implements IItemDragDelegate, IGenerato
             // 安全销毁被合并的物品节点
             item.node.destroy();
 
+            this._saveBoardState();
+
             return true;
         }
 
@@ -301,6 +456,8 @@ export class BoardView extends Component implements IItemDragDelegate, IGenerato
 
         targetItem.setGridPosition(oldCol, oldRow);
         item.setGridPosition(targetCol, targetRow);
+
+        this._saveBoardState();
 
         return true;
     }
